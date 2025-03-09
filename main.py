@@ -1,6 +1,9 @@
+import os
 import json
-
 import numpy as np
+import concurrent.futures
+from multiprocessing import cpu_count
+from tqdm import tqdm
 
 from litellm import completion
 from datasets import load_dataset
@@ -20,46 +23,26 @@ embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 def hungarian_similarity(predicted_embeddings, ground_truth_embeddings, penalty_cost=100.0):
     """
     Computes the optimal matching between predicted and ground truth embeddings using the Hungarian algorithm.
-    This function pads the cost matrix with a high penalty value for unmatched (dummy) entries.
-    
-    Args:
-        predicted_embeddings (np.ndarray): Array of shape (N, D) for predicted keyphrase embeddings.
-        ground_truth_embeddings (np.ndarray): Array of shape (M, D) for ground truth keyphrase embeddings.
-        penalty_cost (float): Cost assigned to dummy entries.
-        
-    Returns:
-        row_ind (np.ndarray): Indices of predicted embeddings that were matched.
-        col_ind (np.ndarray): Indices of ground truth embeddings that were matched.
-        matched_similarities (np.ndarray): Cosine similarity scores for the valid matches.
-        avg_similarity (float): Average cosine similarity over valid matches.
+    Pads the cost matrix with a high penalty for unmatched items.
     """
-    # Compute the pairwise cosine similarity matrix (shape: [N, M])
+    # Compute the pairwise cosine similarity matrix.
     similarity_matrix = cosine_similarity(predicted_embeddings, ground_truth_embeddings)
+    cost_matrix = -similarity_matrix  # Higher similarity → lower cost.
     
-    # Convert similarity matrix to cost matrix for minimization
-    cost_matrix = -similarity_matrix
-    
-    # Determine dimensions and pad to a square matrix
     N, M = cost_matrix.shape
     size = max(N, M)
     padded_cost = np.full((size, size), penalty_cost, dtype=float)
     padded_cost[:N, :M] = cost_matrix
     
-    # Solve the assignment problem using the Hungarian algorithm
     row_ind, col_ind = linear_sum_assignment(padded_cost)
     
-    # Collect only valid matches (those within the original matrix bounds)
-    valid_matches = []
-    for i, j in zip(row_ind, col_ind):
-        if i < N and j < M:
-            valid_matches.append((i, j, similarity_matrix[i, j]))
-    
-    # Extract matched similarities and compute average
-    matched_similarities = np.array([match[2] for match in valid_matches])
+    # Filter out dummy matches.
+    valid_matches = [(i, j, similarity_matrix[i, j])
+                     for i, j in zip(row_ind, col_ind) if i < N and j < M]
+    matched_similarities = np.array([sim for (_, _, sim) in valid_matches])
     avg_similarity = np.mean(matched_similarities) if matched_similarities.size > 0 else 0.0
     
     return row_ind, col_ind, matched_similarities, avg_similarity
-
 
 base_prompt = """
 Given the following text, extract the most relevant keywords or keyphrases that best summarize its content.
@@ -100,7 +83,7 @@ def bench_sample(llm, sample):
     )
     
     generated_keyphrases = json.loads(response.choices[0].message.content)["keyphrases"]
-
+    
     generated_embeddings = [
         embedding_model.encode(keyphrase, normalize_embeddings=True)
         for keyphrase in generated_keyphrases
@@ -109,8 +92,9 @@ def bench_sample(llm, sample):
         embedding_model.encode(keyphrase, normalize_embeddings=True)
         for keyphrase in gt_keyphrases
     ]
+    
     similarity = hungarian_similarity(generated_embeddings, gt_embeddings)
-
+    
     return {
         "generated_keyphrases": generated_keyphrases, 
         "ground_truth_keyphrases": gt_keyphrases, 
@@ -119,12 +103,22 @@ def bench_sample(llm, sample):
 
 dataset = load_dataset("midas/krapivin", "raw")["test"]
 
-test_sample = dataset[0]
+llm_model = "openrouter/google/gemini-2.0-flash-001"
 
-result = bench_sample("openrouter/google/gemini-2.0-flash-001", test_sample)
+def process_sample(sample):
+    try:
+        return bench_sample(llm_model, sample)
+    except Exception as e:
+        print(f"Error processing sample: {e}")
+        return None
 
-print(f"Generated keyphrases: {result['generated_keyphrases']}")
-print(f"Ground truth keyphrases: {result['ground_truth_keyphrases']}")
+results = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()-2) as executor:
+    futures = [executor.submit(process_sample, sample) for sample in dataset]
+    for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing samples"):
+        result = future.result()
+        if result is not None:
+            results.append(result)
 
-rows, cols, matched_sim, avg_sim = result["hungarian_similarity"]
-print(f"Average similarity: {avg_sim}")
+all_avg_sim = np.mean([res["hungarian_similarity"][-1] for res in results])
+print(f"Overall average similarity across dataset: {all_avg_sim}")
