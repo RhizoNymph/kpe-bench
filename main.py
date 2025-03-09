@@ -1,4 +1,3 @@
-import os
 import json
 
 import numpy as np
@@ -19,80 +18,87 @@ class Keyphrase(BaseModel):
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 
 def hungarian_similarity(predicted_embeddings, ground_truth_embeddings):
-    # Compute the pairwise cosine similarity matrix (shape: [N, M])
+    """
+    Compute the optimal matching between predicted and ground truth embeddings 
+    using the Hungarian algorithm and return the indices, matched similarities,
+    and average similarity.
+    """
     similarity_matrix = cosine_similarity(predicted_embeddings, ground_truth_embeddings)
     
-    # Convert similarity matrix to a cost matrix for the minimization problem.
-    # We use the negative because a higher similarity should have a lower cost.
     cost_matrix = -similarity_matrix
-    
-    # Solve the linear assignment problem using the Hungarian algorithm.
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
-    
-    # Extract the similarity scores for the optimal matching.
     matched_similarities = similarity_matrix[row_ind, col_ind]
     
-    # Compute an average similarity score (this can be used as an evaluation metric).
-    avg_similarity = np.mean(matched_similarities) if len(matched_similarities) > 0 else 0.0
+    avg_similarity = np.mean(matched_similarities) if matched_similarities.size > 0 else 0.0
     
     return row_ind, col_ind, matched_similarities, avg_similarity
 
 base_prompt = """
-    Given the following text, extract the most relevant keywords or keyphrases that best summarize its content.  
-    Try to minimze overlap of concepts in keyphrases.
+Given the following text, extract the most relevant keywords or keyphrases that best summarize its content.
+Try to minimize overlap of concepts in keyphrases.
 
-    Return the keywords as a comma-separated list of phrases.  
-    Text:
-    {}    
-    Keywords:
+Return the keywords as a comma-separated list of phrases.
+Text:
+{}
+Keywords:
 """
 
 def bench_sample(llm, sample):
     doc_text = " ".join(sample["document"])
     gt_keyphrases = sample["extractive_keyphrases"] + sample["abstractive_keyphrases"]
-
+    
     response = completion(
-            model=llm,
-            messages=[{"role": "user", "content": base_prompt.format(doc_text)}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "keyphrase_output",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "keyphrases": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of extracted keyphrases"
-                            }
-                        },
-                        "required": ["keyphrases"],
-                        "additionalProperties": False
-                    }
+        model=llm,
+        messages=[{"role": "user", "content": base_prompt.format(doc_text)}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "keyphrase_output",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "keyphrases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of extracted keyphrases"
+                        }
+                    },
+                    "required": ["keyphrases"],
+                    "additionalProperties": False
                 }
             }
+        }
     )
-
+    
     generated_keyphrases = json.loads(response.choices[0].message.content)["keyphrases"]
 
-    generated_embeddings = [embedding_model.encode(generated_keyphrase, normalize_embeddings=True) for generated_keyphrase in ]
-    gt_embeddings = embedding_model(gt_keyphrases, normalize_embeddings=True)
-
+    generated_embeddings = [
+        embedding_model.encode(keyphrase, normalize_embeddings=True)
+        for keyphrase in generated_keyphrases
+    ]
+    gt_embeddings = [
+        embedding_model.encode(keyphrase, normalize_embeddings=True)
+        for keyphrase in gt_keyphrases
+    ]
     similarity = hungarian_similarity(generated_embeddings, gt_embeddings)
 
     return {
-            "generated keyphrases": generated_keyphrases, 
-            "ground truth keyphrases": gt_keyphrases, 
-            "hungarian similarity": similarity
-            }
+        "generated_keyphrases": generated_keyphrases, 
+        "ground_truth_keyphrases": gt_keyphrases, 
+        "hungarian_similarity": similarity
+    }
 
-# get entire dataset
 dataset = load_dataset("midas/krapivin", "raw")["test"]
 
-test = dataset[0]
-result = bench_sample("openrouter/google/gemini-2.0-flash-001", test)
-print("generated keyphrases: " + result["generated keyphrases"])
-print("ground truth keyphrases: " + result["ground truth keyphrases"])
-print("hungarian similarity: " + result["hungarian similarity"])
+test_sample = dataset[0]
+
+result = bench_sample("openrouter/google/gemini-2.0-flash-001", test_sample)
+
+print(f"Generated keyphrases: {result['generated_keyphrases']}")
+print(f"Ground truth keyphrases: {result['ground_truth_keyphrases']}")
+
+rows, cols, matched_sim, avg_sim = result["hungarian_similarity"]
+print(f"Hungarian matched indices (generated, ground truth): {list(zip(rows, cols))}")
+print(f"Matched similarities: {matched_sim}")
+print(f"Average similarity: {avg_sim}")
