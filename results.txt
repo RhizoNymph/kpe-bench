@@ -1,1 +1,11 @@
-gemini-2.0-flash-001 0.7561569213867188
+gemini-2.0-flash-001 
+Overall average similarity across dataset: 0.7562660574913025
+Total tokens sent (prompts): 26925343
+Total tokens received (completions): 265249
+Total tokens overall: 27190592
+
+qwen2.5-32b-instruct
+Overall average similarity across dataset: 0.7628480195999146
+Total tokens sent (prompts): 26607791
+Total tokens received (completions): 216989
+Total tokens overall: 26824780

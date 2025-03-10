@@ -63,31 +63,14 @@ def bench_sample(llm, sample):
     
     response = completion(
         model=llm,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "keyphrase_output",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "keyphrases": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of extracted keyphrases"
-                        }
-                    },
-                    "required": ["keyphrases"],
-                    "additionalProperties": False
-                }
-            }
-        }
+        messages=[{"role": "user", "content": prompt}]
     )
     
     completion_tokens = response.usage.completion_tokens
     
-    generated_keyphrases = json.loads(response.choices[0].message.content)["keyphrases"]
+    response_text = response.choices[0].message.content
+
+    generated_keyphrases = response_text.split(",")
     
     generated_embeddings = [
         embedding_model.encode(keyphrase, normalize_embeddings=True)
@@ -110,7 +93,7 @@ def bench_sample(llm, sample):
 
 dataset = load_dataset("midas/krapivin", "raw")["test"]
 
-llm_model = "openrouter/anthropic/claude-3.5-haiku-20241022:beta"
+llm_model = "openrouter/qwen/qwen2.5-32b-instruct"
 
 def process_sample(sample):
     try:
@@ -149,26 +132,7 @@ def estimate_dataset_tokens(llm_model, dataset):
         try:
             response = completion(
                 model=llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "keyphrase_output",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "keyphrases": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "List of extracted keyphrases"
-                                }
-                            },
-                            "required": ["keyphrases"],
-                            "additionalProperties": False
-                        }
-                    }
-                }
+                messages=[{"role": "user", "content": prompt}]
             )
             completion_tokens = response.usage.completion_tokens
             total_completion_sample_tokens += completion_tokens
@@ -186,8 +150,26 @@ def estimate_dataset_tokens(llm_model, dataset):
         "estimated_total_tokens": int(total_prompt_tokens + estimated_total_completion_tokens)
     }
 
-# Update the print statements
-token_estimates = estimate_dataset_tokens(llm_model, dataset)
+# Function to handle token estimates with file caching
+def get_token_estimates(llm_model, dataset, estimate_file="token_estimates.json"):
+    if os.path.exists(estimate_file):
+        print(f"Loading token estimates from {estimate_file}...")
+        with open(estimate_file, 'r') as f:
+            token_estimates = json.load(f)
+        return token_estimates
+    
+    print("Calculating token estimates (this may take a while)...")
+    token_estimates = estimate_dataset_tokens(llm_model, dataset)
+    
+    # Save estimates to file for future use
+    with open(estimate_file, 'w') as f:
+        json.dump(token_estimates, f, indent=2)
+    print(f"Token estimates saved to {estimate_file}")
+    
+    return token_estimates
+
+# Get token estimates (from file if available, or calculate and save)
+token_estimates = get_token_estimates(llm_model, dataset)
 print(f"Estimated token usage for entire dataset:")
 print(f"  - Prompt tokens (exact): {token_estimates['prompt_tokens']:,}")
 print(f"  - Completion tokens (estimated): {token_estimates['estimated_completion_tokens']:,}")
