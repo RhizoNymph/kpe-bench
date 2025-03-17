@@ -20,7 +20,7 @@ class Keyphrase(BaseModel):
 
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 
-def hungarian_similarity(predicted_embeddings, ground_truth_embeddings, penalty_cost=100.0):
+def hungarian_similarity(predicted_embeddings, ground_truth_embeddings, penalty_cost=2.0):
     """
     Computes the optimal matching between predicted and ground truth embeddings using the Hungarian algorithm.
     Pads the cost matrix with a high penalty for unmatched items.
@@ -93,7 +93,7 @@ def bench_sample(llm, sample):
 
 dataset = load_dataset("midas/krapivin", "raw")["test"]
 
-llm_model = "openrouter/qwen/qwen2.5-32b-instruct"
+llm_model = "openrouter/google/gemini-2.0-flash-001"
 
 def process_sample(sample):
     try:

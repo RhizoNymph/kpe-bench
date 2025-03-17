@@ -9,3 +9,9 @@ Overall average similarity across dataset: 0.7628480195999146
 Total tokens sent (prompts): 26607791
 Total tokens received (completions): 216989
 Total tokens overall: 26824780
+
+gemma-3-27B-it
+Overall average similarity across dataset: 0.7594686150550842
+Total tokens sent (prompts): 25339585
+Total tokens received (completions): 223009
+Total tokens overall: 25562594
