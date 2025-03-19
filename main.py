@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 import numpy as np
 import concurrent.futures
 from multiprocessing import cpu_count
@@ -91,9 +92,13 @@ def bench_sample(llm, sample):
         "completion_tokens": completion_tokens
     }
 
-dataset = load_dataset("midas/krapivin", "raw")["test"]
+if len(sys.argv) < 2:
+    print("Usage: python main.py <llm_model> (litellm model name)")
+    exit()
 
-llm_model = "openrouter/google/gemini-2.0-flash-001"
+llm_model = sys.argv[1]
+
+dataset = load_dataset("midas/krapivin", "raw")["test"]
 
 def process_sample(sample):
     try:
