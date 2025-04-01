@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
-"""Keyphrase Extraction Fine-tuning with GRPO"""
-
-# All imports at the top
-from unsloth import FastModel
+from unsloth import FastModel, FastLanguageModel
 import torch
 from datasets import load_dataset, config
 from sentence_transformers import SentenceTransformer
@@ -13,6 +9,10 @@ import re
 from trl import GRPOConfig, GRPOTrainer
 from transformers import TextStreamer, Trainer, TrainingArguments
 import wandb
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
+from collections import Counter
 
 # Set parameters
 max_seq_length = 4096  # Increased significantly
@@ -22,26 +22,13 @@ max_prompt_length = 3840  # Most of the sequence length for input
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device="cuda")
 
 # Load base model
-model, tokenizer = FastModel.from_pretrained(
-    model_name = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
-    max_seq_length = max_seq_length,
-    load_in_4bit = True,
-    load_in_8bit = False,
-    full_finetuning = False,
-)
-
-# Add LoRA adapters
-model = FastModel.get_peft_model(
-    model,
-    finetune_vision_layers = False,
-    finetune_language_layers = True,
-    finetune_attention_modules = True,
-    finetune_mlp_modules = True,
-    r = 8,
-    lora_alpha = 8,
-    lora_dropout = 0,
-    bias = "none",
-    random_state = 3407,
+model, tokenizer = FastLanguageModel.from_pretrained(
+    #model_name="/home/nymph/.cache/huggingface/hub/models--unsloth--Mistral-Small-3.1-24B-Instruct-2503-unsloth-bnb-4bit",
+    model_name="unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
+    max_seq_length=max_seq_length,
+    load_in_4bit=True,
+    load_in_8bit=False,
+    full_finetuning=False,
 )
 
 # Define keyphrase format tags
@@ -49,66 +36,140 @@ keyphrase_start = "<keyphrases>"
 keyphrase_end = "</keyphrases>"
 
 # Define system prompt
-system_prompt = f"""You are given a document.
-Extract the most relevant keywords or keyphrases that best summarize its content.
-Try to minimize overlap of concepts in keyphrases.
+system_prompt = """You are a keyphrase extraction assistant. Your only task is to extract relevant keyphrases from documents.
 
-IMPORTANT: You must return your answer in the following format:
-{keyphrase_start}keyword1, keyword2, keyword3, ...{keyphrase_end}
+IMPORTANT: You must ONLY return keyphrases in this exact format:
+<keyphrases>keyphrase1, keyphrase2, keyphrase3, ...</keyphrases>
 
-Here are some examples:
+Remember:
+- Only output the keyphrases in the specified format
+- Do not include any other text or explanation
+- Separate keyphrases with commas"""
 
-Document: Machine learning is a field of study that gives computers the ability to learn without being explicitly programmed.
-{keyphrase_start}machine learning, computer programming, automated learning{keyphrase_end}
+def prepare_document(doc):
+    """Better document preparation with focus on important sections"""
+    # Remove excessive whitespace and normalize
+    doc = " ".join(doc)
+    return doc
 
-Document: Climate change refers to long-term shifts in temperatures and weather patterns.
-{keyphrase_start}climate change, global warming, weather patterns, long-term temperature shifts{keyphrase_end}
+# Load dataset and limit if needed
+dataset = load_dataset("midas/kp20k", "raw", split="train")
+print("Dataset fields:", list(dataset[0].keys()))
+print("Example document:", dataset[0]["document"])
+print("Example keyphrases:", dataset[0]["extractive_keyphrases"])
+print("Dataset length:", len(dataset))
 
-Now extract keyphrases from the document I will provide.
+max_samples = None
+if max_samples and max_samples < len(dataset):
+    print(f"Limiting dataset to {max_samples} samples")
+    dataset = dataset.select(range(min(max_samples, len(dataset))))
 
-Document:
-"""
+# Calculate keyphrase statistics first
+print("\nCalculating keyphrase statistics...")
+keyphrase_counts = []
+for sample in tqdm(dataset, desc="Counting keyphrases"):
+    combined_keyphrases = list(set(
+        (sample["extractive_keyphrases"] if isinstance(sample["extractive_keyphrases"], list) else []) + 
+        (sample["abstractive_keyphrases"] if isinstance(sample["abstractive_keyphrases"], list) else [])
+    ))
+    if len(combined_keyphrases) > 0:  # Only include documents with at least one keyphrase
+        keyphrase_counts.append(len(combined_keyphrases))
 
-# Define regex pattern for matching
-match_format = re.compile(
-    rf"^[\s]{{0,}}"\
-    rf"{keyphrase_start}(.+?){keyphrase_end}"\
-    rf"[\s]{{0,}}$",
-    flags = re.MULTILINE | re.DOTALL
+print(f"\nTotal documents: {len(dataset):,}")
+print(f"Documents with keyphrases: {len(keyphrase_counts):,}")
+print(f"Documents with no keyphrases: {len(dataset) - len(keyphrase_counts):,}")
+
+min_keyphrases = min(keyphrase_counts)
+max_keyphrases = max(keyphrase_counts)
+avg_keyphrases = sum(keyphrase_counts) / len(keyphrase_counts)
+median_keyphrases = sorted(keyphrase_counts)[len(keyphrase_counts)//2]
+
+print(f"\nKeyphrase Statistics (excluding documents with no keyphrases):")
+print(f"Minimum keyphrases per document: {min_keyphrases:,}")
+print(f"Maximum keyphrases per document: {max_keyphrases:,}")
+print(f"Average keyphrases per document: {avg_keyphrases:.1f}")
+print(f"Median keyphrases per document: {median_keyphrases:,}")
+print(f"Total keyphrases in dataset: {sum(keyphrase_counts):,}\n")
+
+def count_tokens_for_sample(doc_text):    
+    """Helper function to count tokens for a single sample"""
+    prompt = tokenizer.apply_chat_template([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": doc_text}
+    ], add_generation_prompt=True, tokenize=False)
+    tokens = len(tokenizer(prompt)["input_ids"][0])
+    return tokens
+
+# Calculate dataset token statistics using ThreadPoolExecutor
+print("\nCalculating dataset token statistics...")
+doc_token_counts = [None] * len(dataset)
+num_workers = max(1, cpu_count() - 2)
+print(f"Using {num_workers} workers for parallel processing...")
+
+with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    futures = {}
+    for i, sample in tqdm(enumerate(dataset), total=len(dataset), desc="Submitting tasks"):
+        doc_text = prepare_document(sample["document"])
+        futures[executor.submit(count_tokens_for_sample, doc_text)] = i
+    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing results"):
+        try:
+            token_count = future.result()
+            original_index = futures[future]
+            doc_token_counts[original_index] = token_count
+        except Exception as e:
+            print(f"Error processing sample: {e}")
+            doc_token_counts[futures[future]] = 0
+
+doc_token_counts = [count for count in doc_token_counts if count is not None]
+min_tokens = min(doc_token_counts)
+max_tokens = max(doc_token_counts)
+avg_tokens = sum(doc_token_counts) / len(doc_token_counts)
+median_tokens = sorted(doc_token_counts)[len(doc_token_counts)//2]
+
+print(f"\nDataset Token Statistics:")
+print(f"Minimum tokens per document: {min_tokens:,}")
+print(f"Maximum tokens per document: {max_tokens:,}")
+print(f"Average tokens per document: {avg_tokens:,.1f}")
+print(f"Median tokens per document: {median_tokens:,}")
+print(f"Total tokens in dataset: {sum(doc_token_counts):,}\n")
+
+# Add LoRA adapters
+model = FastLanguageModel.get_peft_model(
+    model,
+    finetune_vision_layers=False,
+    finetune_language_layers=True,
+    finetune_attention_modules=True,
+    finetune_mlp_modules=True,
+    r=8,
+    lora_alpha=8,
+    lora_dropout=0,
+    bias="none",
+    random_state=3407,
 )
 
-# Define Hungarian similarity function
-def hungarian_similarity(predicted_embeddings, ground_truth_embeddings, penalty_cost=2.0):
-    """
-    Computes the optimal matching between predicted and ground truth embeddings using the Hungarian algorithm.
-    Pads the cost matrix with a high penalty for unmatched items.
-    """
-    # Compute the pairwise cosine similarity matrix.
-    similarity_matrix = cosine_similarity(predicted_embeddings, ground_truth_embeddings)
-    cost_matrix = -similarity_matrix  # Higher similarity → lower cost.
-    
-    N, M = cost_matrix.shape
-    size = max(N, M)
-    padded_cost = np.full((size, size), penalty_cost, dtype=float)
-    padded_cost[:N, :M] = cost_matrix
-    
-    row_ind, col_ind = linear_sum_assignment(padded_cost)
-    
-    # Filter out dummy matches.
-    valid_matches = [(i, j, similarity_matrix[i, j])
-                     for i, j in zip(row_ind, col_ind) if i < N and j < M]
-    matched_similarities = np.array([sim for (_, _, sim) in valid_matches])
-    avg_similarity = np.mean(matched_similarities) if matched_similarities.size > 0 else 0.0
-    
-    return row_ind, col_ind, matched_similarities, avg_similarity
+# Precompile regex pattern for matching keyphrase format
+match_format = re.compile(
+    rf"^[\s]*{keyphrase_start}(.+?){keyphrase_end}[\s]*$",
+    flags=re.MULTILINE | re.DOTALL
+)
 
-# Define reward functions
-def match_format_exactly(prompts, completions, **kwargs):
+###############################################################################
+# Improved Reward Functions
+###############################################################################
+
+def improved_format_reward(prompts, completions, **kwargs):
+    """
+    Computes a continuous reward based on how well the completion follows the
+    desired keyphrase format. Rewards are given for:
+      - Presence of start and end tags.
+      - A regex match to extract keyphrases.
+      - A number of keyphrases near the desired range (ideally 3 to 6).
+    """
     scores = []
     for prompt, completion in zip(prompts, completions):
-        score = 0
-        response = completion  # completion is already a string
-        
+        response = completion.strip()
+        score = 0.0
+
         if len(scores) < 2:
             try:
                 import shutil
@@ -155,150 +216,121 @@ def match_format_exactly(prompts, completions, **kwargs):
             
             print(divider + "\n")
         
-        # Give partial credit for just having the tags
-        if keyphrase_start in response and keyphrase_end in response:
-            # Get the text between the tags (even if not a perfect match)
-            start_idx = response.find(keyphrase_start) + len(keyphrase_start)
-            end_idx = response.find(keyphrase_end, start_idx)
-            
-            if start_idx > 0 and end_idx > start_idx:
-                extracted = response[start_idx:end_idx].strip()
-                if extracted and "," in extracted:
-                    # Good response with multiple keyphrases
-                    score += 2.0
-                elif extracted:
-                    # At least something between tags
-                    score += 1.0
-            
-        # Also check for exact format match
-        if match_format.search(response) is not None:
-            score += 1.0  # Bonus for exact format match
-            
-        scores.append(score)
-    return scores
-
-def match_format_approximately(completions, **kwargs):
-    scores = []
-    for completion in completions:
-        score = 0
-        response = completion  # completion is already a string
-        
-        # Check for individual tags with partial scoring
+        # Check for the required start/end tags
         if keyphrase_start in response:
-            score += 0.5
+            score += 0.3
         else:
             score -= 0.3
-            
         if keyphrase_end in response:
-            score += 0.5
+            score += 0.3
         else:
             score -= 0.3
-            
+
+        # Try to extract keyphrases using the regex pattern
+        match = re.search(match_format, response)
+        if match:
+            content = match.group(1).strip()
+            keyphrases = [k.strip() for k in content.split(",") if k.strip()]
+            # Provide partial credit: ideal if between 3 and 6 keyphrases
+            if 3 <= len(keyphrases) <= 6:
+                score += 0.4
+            else:
+                # If off by one, give a bit of credit; otherwise penalize slightly
+                diff = min(abs(len(keyphrases) - 3), abs(len(keyphrases) - 6))
+                if diff == 1:
+                    score += 0.2
+                else:
+                    score -= 0.2
+        else:
+            score -= 0.4
+
+        # Clip score to the range [-1, 1]
+        score = max(-1.0, min(1.0, score))
         scores.append(score)
+    print(f"Improved format scores: {scores}")
     return scores
 
-def keyphrase_similarity_reward(prompts, completions, **kwargs):
+def improved_semantic_reward(prompts, completions, **kwargs):
+    """
+    Computes semantic reward using many-to-many matching approach:
+    1. For each predicted keyphrase, finds its best matching ground truth phrases
+    2. For each ground truth keyphrase, finds its best matching predictions
+    3. Balances precision and recall-like metrics
+    4. Penalizes redundancy within predictions
+    """
+    ground_truth = kwargs["ground_truth"]
     scores = []
     
-    if "ground_truth" not in kwargs:
-        print("WARNING: ground_truth not found in kwargs")
-        return [0.0] * len(completions)
-    
-    ground_truth_keyphrases = kwargs["ground_truth"]
-    
-    for completion, gt_keyphrases in zip(completions, ground_truth_keyphrases):
-        response = completion  # completion is already a string
-        match = match_format.search(response)
+    for completion in completions:
+        response = completion.strip()
+        reward = -1.0  # Default penalty
+        match_pred = re.search(match_format, response)
+        match_gt = re.search(match_format, ground_truth[0])
         
-        if match is None:
-            scores.append(0)
-            continue
+        if match_pred and match_gt:
+            pred_content = match_pred.group(1).strip()
+            gt_content = match_gt.group(1).strip()
+            pred_keyphrases = [k.strip() for k in pred_content.split(",") if k.strip()]
+            gt_keyphrases = [k.strip() for k in gt_content.split(",") if k.strip()]
             
-        # Extract keyphrases from the response
-        extracted_text = match.group(1).strip()
-        generated_keyphrases = [kp.strip() for kp in extracted_text.split(",") if kp.strip()]
-        
-        if not generated_keyphrases:
-            scores.append(0)
-            continue
-        
-        # Get embeddings
-        try:
-            generated_embeddings = [
-                embedding_model.encode(kp, normalize_embeddings=True) 
-                for kp in generated_keyphrases
-            ]
-            gt_embeddings = [
-                embedding_model.encode(kp, normalize_embeddings=True)
-                for kp in gt_keyphrases
-            ]
-            
-            # Use Hungarian algorithm for matching
-            _, _, _, avg_similarity = hungarian_similarity(
-                generated_embeddings, 
-                gt_embeddings
-            )
-
-            print(f"Average similarity: {avg_similarity}")
-            
-            # Scale similarity to reasonable reward range
-            reward = avg_similarity * 3.0  # Scale up to max ~3.0
-            scores.append(reward)
-            
-        except Exception as e:
-            print(f"Error computing embeddings: {e}")
-            scores.append(0)
-            
+            if pred_keyphrases and gt_keyphrases:
+                # Get embeddings
+                pred_embeddings = embedding_model.encode(pred_keyphrases)
+                gt_embeddings = embedding_model.encode(gt_keyphrases)
+                
+                # Compute similarity matrix
+                similarity_matrix = cosine_similarity(pred_embeddings, gt_embeddings)
+                
+                # Precision-like score: how well each prediction matches ground truth
+                precision_score = similarity_matrix.max(axis=1).mean()
+                
+                # Recall-like score: how well ground truth is covered by predictions
+                recall_score = similarity_matrix.max(axis=0).mean()
+                
+                # Check for redundancy within predictions
+                pred_self_sim = cosine_similarity(pred_embeddings)
+                np.fill_diagonal(pred_self_sim, 0)
+                redundancy_penalty = 0
+                if len(pred_self_sim) > 1:
+                    # Calculate average similarity between different predictions
+                    redundancy_penalty = pred_self_sim.mean()
+                
+                # Combine scores with F1-like balancing
+                semantic_score = 2 * (precision_score * recall_score) / (precision_score + recall_score + 1e-8)
+                
+                # Apply redundancy penalty
+                reward = semantic_score * (1 - 0.5 * redundancy_penalty)
+                
+                # Scale to [-1, 1]
+                reward = 2 * reward - 1
+                
+        scores.append(reward)
+    print(f"Improved semantic scores: {scores}")
     return scores
 
-def prepare_document(doc):
-    """Better document preparation with focus on important sections"""
-    if isinstance(doc, list):
-        doc = " ".join(doc)
-    
-    # Remove excessive whitespace and normalize
-    doc = " ".join(doc.split())
-    
-    # If document is very long, try to keep most important parts
-    words = doc.split()
-    if len(words) > 3840:  # Using tokens would be more accurate, but words as approximation
-        # Keep first 2000 words (usually abstract + intro) and last 1840 (usually conclusion/summary)
-        doc = " ".join(words[:2000] + words[-1840:])
-    
-    return doc
+###############################################################################
+# Dataset Mapping & Prompt Preparation
+###############################################################################
 
-# Add longer timeout and retry settings for dataset loading
-config.HF_DATASETS_TIMEOUT = 100  # Increase timeout to 100 seconds
-config.MAX_RETRIES = 3  # Add retries
-
-
-dataset = load_dataset("midas/krapivin", "raw", split="test")
-
-print("Dataset fields:", list(dataset[0].keys()))
-print("Example document:", dataset[0]["document"][:2])
-print("Example keyphrases:", dataset[0]["extractive_keyphrases"])
-
-# Limit dataset size for initial training
-max_samples = 100  # Adjust as needed
-dataset = dataset.select(range(min(max_samples, len(dataset))))
-
-# Map the dataset with better processing
+# Update dataset mapping to wrap keyphrases in tags
 dataset = dataset.map(lambda x: {
     "prompt": tokenizer.apply_chat_template([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prepare_document(x["document"])}
     ], add_generation_prompt=True, tokenize=False),
-    "ground_truth": list(set(  # Remove duplicates
+    "ground_truth": f"{keyphrase_start}" + ", ".join(list(set(
         (x["extractive_keyphrases"] if isinstance(x["extractive_keyphrases"], list) else []) + 
         (x["abstractive_keyphrases"] if isinstance(x["abstractive_keyphrases"], list) else [])
-    ))
+    ))) + f"{keyphrase_end}"
 })
 
-# Add debug print to verify prompt format
 print("\nVerifying prompt format:")
-print(dataset[0]["prompt"][:500], "...\n")  # Print first 500 chars of first example
+print(dataset[0]["prompt"][:500], "...\n")
 
-# Check if model understands format before training
+###############################################################################
+# Testing Model & Streamer Setup (Unchanged)
+###############################################################################
+
 print("Testing model's understanding of the format before training...")
 test_doc = "Machine learning is a field of inquiry devoted to understanding and building methods that learn."
 test_prompt = [
@@ -307,7 +339,6 @@ test_prompt = [
 ]
 test_text = tokenizer.apply_chat_template(test_prompt, add_generation_prompt=True, tokenize=False)
 
-# Create a custom streamer to capture output
 class CaptureStreamer(TextStreamer):
     def __init__(self, tokenizer, skip_prompt, test_doc):
         super().__init__(tokenizer, skip_prompt)
@@ -321,7 +352,6 @@ class CaptureStreamer(TextStreamer):
         lines = []
         current_line = []
         current_length = 0
-        
         for word in words:
             if current_length + len(word) + 1 <= width:
                 current_line.append(word)
@@ -330,26 +360,20 @@ class CaptureStreamer(TextStreamer):
                 lines.append(" ".join(current_line))
                 current_line = [word]
                 current_length = len(word)
-        
         if current_line:
             lines.append(" ".join(current_line))
         return lines
         
     def put(self, value):
-        # Decode the tensor to text before adding to generated_text
         if torch.is_tensor(value):
             text = self.tokenizer.decode(value[0], skip_special_tokens=True)
         else:
             text = value
-            
-        # Only start capturing after we see "model" token
         if "model" in text:
             self.started_generating = True
-            text = text.split("model")[-1]  # Only keep text after "model"
-            
+            text = text.split("model")[-1]
         if self.started_generating:
             self.generated_text += text
-            # Also print the text as it's generated
             print(text, end="", flush=True)
         
     def end(self):
@@ -358,27 +382,18 @@ class CaptureStreamer(TextStreamer):
             terminal_width = shutil.get_terminal_size().columns
         except:
             terminal_width = 80
-        
-        # Calculate width for each half
         half_width = (terminal_width - 3) // 2
         divider = "-" * terminal_width
-        
-        print("\n")  # Add some spacing before the side-by-side view
-        
-        # Get input and output lines using class method
+        print("\n")
         input_lines = self.split_text(self.test_doc, half_width)
         output_lines = self.split_text(self.generated_text.strip(), half_width)
-        
         print(divider)
         print("INPUT".ljust(half_width) + " | " + "OUTPUT".ljust(half_width))
         print("-" * half_width + "-+-" + "-" * half_width)
-        
-        # Print both sides line by line
         for i in range(max(len(input_lines), len(output_lines))):
             left = input_lines[i] if i < len(input_lines) else ""
             right = output_lines[i] if i < len(output_lines) else ""
             print(f"{left:<{half_width}} | {right:<{half_width}}")
-        
         print(divider + "\n")
 
 streamer = CaptureStreamer(tokenizer, skip_prompt=True, test_doc=test_doc)
@@ -393,64 +408,85 @@ _ = model.generate(
     streamer=streamer,
 )
 print("Starting GRPO training...")
+print("Note: You might have to wait 150-200 steps to see improvement.")
+print("The model may get 0 reward for the first 100 steps. Please be patient!")
 
-# Configure GRPO Trainer with wandb instead of tensorboard
+###############################################################################
+# GRPO Trainer Setup with Improved Reward Functions
+###############################################################################
+
 training_args = GRPOConfig(
-    learning_rate = 2e-6,  # Lower learning rate for semantic task
-    adam_beta1 = 0.9,
-    adam_beta2 = 0.999,  # Higher beta2 for more stable training
-    weight_decay = 0.01,
-    warmup_ratio = 0.05,  # Longer warmup for semantic tasks
-    lr_scheduler_type = "cosine",
-    optim = "adamw_torch_fused",
-    logging_steps = 1,
-    
-    per_device_train_batch_size = 4,  # Larger batch size if memory allows
-    gradient_accumulation_steps = 4,
-    num_generations = 4,  # More generations for better reward estimation
-    
-    max_prompt_length = 3840,  # Much larger input context
-    max_completion_length = 256,  # Keep this reasonable since outputs are keyphrases
-    max_steps = 500,  # More steps for semantic learning
-    save_steps = 100,
-    max_grad_norm = 1.0,
-    report_to = "wandb",  # Changed from "tensorboard" to "wandb"
-    output_dir = "outputs-keyphrase",
+    learning_rate=2e-5,
+    adam_beta1=0.9,
+    adam_beta2=0.95,
+    weight_decay=0.05,
+    warmup_ratio=0.03,
+    lr_scheduler_type="constant",
+    optim="adamw_torch_fused",
+    logging_steps=1,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    num_generations=8,
+    temperature=1.5,
+    max_prompt_length=max_prompt_length,
+    max_completion_length=max_seq_length - max_prompt_length,
+    max_steps=500,
+    save_steps=50,
+    max_grad_norm=1.0,
+    report_to="wandb",
+    # scale_rewards=False,
+    # num_iterations=4
+    # use_vllm=True
 )
 
-# Ensure consistent tokenizer settings
 tokenizer.padding_side = "right"
 tokenizer.truncation_side = "left"
 tokenizer.pad_token = tokenizer.eos_token
 
-# Add before trainer initialization
 wandb.init(
     project="keyphrase-extraction",
     config={
         "learning_rate": training_args.learning_rate,
         "batch_size": training_args.per_device_train_batch_size,
-        "model": "gemma-3b",
-        "task": "keyphrase_extraction"
+        "model": "gemma-3-12b-it-unsloth-bnb-4bit",
+        "task": "kp20k-keyphrase-extraction"
     }
 )
 
-# Update trainer initialization (remove formatting_func)
+# Use the improved reward functions here.
 trainer = GRPOTrainer(
-    model = model,
-    processing_class = tokenizer,
-    reward_funcs = [
-        match_format_exactly,
-        match_format_approximately,
-        keyphrase_similarity_reward,
-    ],
-    reward_weights = [0.2, 0.1, 0.7],
-    args = training_args,
-    train_dataset = dataset,
+    model=model,
+    processing_class=tokenizer,
+    reward_funcs=[improved_format_reward, improved_semantic_reward],
+    reward_weights=[0.3, 0.7],
+    args=training_args,
+    train_dataset=dataset
 )
+
+# Quick test of the new reward functions
+print("\nTesting improved reward functions...")
+test_prompts = ["test prompt"]
+test_completions = [
+    "<keyphrases>good keyphrase, another good one</keyphrases>",
+    "bad format no tags",
+    "<keyphrases>duplicate, duplicate</keyphrases>"
+]
+test_kwargs = {"ground_truth": ["<keyphrases>ground truth, test phrase</keyphrases>"]}
+
+print("\nTesting improved format reward:")
+improved_format_scores = improved_format_reward(test_prompts * 3, test_completions, **test_kwargs)
+print(f"Improved Format scores: {improved_format_scores}")
+
+print("\nTesting improved semantic reward:")
+improved_semantic_scores = improved_semantic_reward(test_prompts * 3, test_completions, **test_kwargs)
+print(f"Improved Semantic scores: {improved_semantic_scores}")
+
 trainer.train()
 
 # Inference example
-sample_doc = "Machine learning is a field of inquiry devoted to understanding and building methods that learn, that is, methods that leverage data to improve performance on some set of tasks. It is seen as a part of artificial intelligence."
+sample_doc = ("Machine learning is a field of inquiry devoted to understanding and building methods that learn, "
+              "that is, methods that leverage data to improve performance on some set of tasks. It is seen as a part "
+              "of artificial intelligence.")
 
 messages = [
     {"role": "system", "content": system_prompt},
@@ -459,40 +495,17 @@ messages = [
 
 text = tokenizer.apply_chat_template(
     messages,
-    add_generation_prompt = True,
-    tokenize = False,
+    add_generation_prompt=True,
+    tokenize=False,
 )
 
 _ = model.generate(
-    **tokenizer(text, return_tensors = "pt").to("cuda"),
-    max_new_tokens = 64,
-    temperature = 1.0, top_p = 0.95, top_k = 64,
-    streamer = TextStreamer(tokenizer, skip_prompt = True),
+    **tokenizer(text, return_tensors="pt").to("cuda"),
+    max_new_tokens=64,
+    temperature=1.0, top_p=0.95, top_k=64,
+    streamer=TextStreamer(tokenizer, skip_prompt=True),
 )
 
 # Saving the model
 model.save_pretrained("gemma-3-keyphrase")
 tokenizer.save_pretrained("gemma-3-keyphrase")
-
-def evaluate_model(model, tokenizer, eval_dataset, num_samples=10):
-    """Evaluate model performance on a subset of data"""
-    total_similarity = 0
-    
-    for i in range(num_samples):
-        sample = eval_dataset[i]
-        messages = sample["prompt"]
-        text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        
-        outputs = model.generate(
-            **tokenizer(text, return_tensors="pt").to("cuda"),
-            max_new_tokens=64,
-            temperature=0.7,
-        )
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Compute similarity with ground truth...
-        # Add similarity to total...
-        
-    return total_similarity / num_samples
-
-# Add evaluation callback to training loop
