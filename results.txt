@@ -15,3 +15,9 @@ Overall average similarity across dataset: 0.7594686150550842
 Total tokens sent (prompts): 25339585
 Total tokens received (completions): 223009
 Total tokens overall: 25562594
+
+mistral-3.1-small-instruct
+Overall average similarity across dataset: 0.7545846700668335
+Total tokens sent (prompts): 25782237
+Total tokens received (completions): 1376999
+Total tokens overall: 27159236
